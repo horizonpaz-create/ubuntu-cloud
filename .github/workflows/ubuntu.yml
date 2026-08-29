@@ -1,0 +1,109 @@
+name: Ubuntu 22.04 Cloud Server
+
+on:
+  workflow_dispatch:
+
+jobs:
+  server:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 360
+
+    steps:
+      - name: Install Tailscale
+        env:
+          TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+        run: |
+          if [ -z "$TAILSCALE_AUTHKEY" ]; then
+            echo "No TAILSCALE_AUTHKEY - will use bore fallback"
+            exit 0
+          fi
+          curl -fsSL https://tailscale.com/install.sh | sh
+          sudo tailscale up --authkey="$TAILSCALE_AUTHKEY" --hostname="horizon-ubuntu-$GITHUB_RUN_ID" || \
+            sudo tailscale up --authkey="$TAILSCALE_AUTHKEY" --hostname="horizon-ubuntu2-$GITHUB_RUN_ID"
+          for i in 1 2 3 4 5; do tailscale ip -4 && break || sleep 5; done
+
+      - name: Configure SSH (key + password)
+        env:
+          SSH_PUBLIC_KEY: ${{ secrets.SSH_PUBLIC_KEY }}
+        run: |
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          if [ -n "$SSH_PUBLIC_KEY" ]; then
+            echo "$SSH_PUBLIC_KEY" >> ~/.ssh/authorized_keys
+            chmod 600 ~/.ssh/authorized_keys
+            echo "SSH key added"
+          fi
+          sudo sed -i 's/^#*PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config
+          sudo sed -i 's/^#*PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config
+          sudo sed -i 's/^#*ChallengeResponseAuthentication.*/ChallengeResponseAuthentication no/' /etc/ssh/sshd_config
+          sudo sed -i 's/^#*UsePAM.*/UsePAM yes/' /etc/ssh/sshd_config
+          echo "PasswordAuthentication yes" | sudo tee -a /etc/ssh/sshd_config >/dev/null
+          sudo grep -q "^PermitRootLogin" /etc/ssh/sshd_config || echo "PermitRootLogin yes" | sudo tee -a /etc/ssh/sshd_config >/dev/null
+          echo "runner:HorizonVPS2024!" | sudo chpasswd
+          echo "root:HorizonRoot2024!" | sudo chpasswd
+          sudo systemctl restart ssh || sudo systemctl start ssh
+          sudo systemctl status ssh --no-pager | head -n 20 || true
+          echo "=========================================="
+          echo " Ubuntu 22.04 SERVER IS READY"
+          echo "=========================================="
+          echo "Tailscale IPv4:"
+          tailscale ip -4 || echo "(no tailscale IP - fallback will be used)"
+          echo ""
+          echo "SSH users: runner / root"
+          echo "Password runner: HorizonVPS2024!"
+          echo "Password root: HorizonRoot2024!"
+          echo "whoami: $(whoami)"
+          if tailscale ip -4 >/dev/null 2>&1; then
+            echo "SSH Tailscale: ssh runner@$(tailscale ip -4)"
+            echo "SSH Tailscale root: ssh root@$(tailscale ip -4)"
+          fi
+          echo "=========================================="
+
+      - name: Fallback - bore tunnel (if no Tailscale)
+        run: |
+          if tailscale ip -4 >/dev/null 2>&1; then
+            echo "Tailscale up - skipping bore"
+            exit 0
+          fi
+          echo "Tailscale not available - starting bore tunnel..."
+          # install bore
+          if ! command -v bore >/dev/null 2>&1; then
+            echo "Installing bore..."
+            curl -fsSL https://github.com/ekzhang/bore/releases/download/v0.5.1/bore-v0.5.1-x86_64-unknown-linux-gnu.tar.gz -o /tmp/bore.tar.gz || wget -q https://github.com/ekzhang/bore/releases/download/v0.5.1/bore-v0.5.1-x86_64-unknown-linux-gnu.tar.gz -O /tmp/bore.tar.gz || true
+            tar -xzf /tmp/bore.tar.gz -C /tmp || true
+            sudo mv /tmp/bore /usr/local/bin/bore 2>/dev/null || sudo mv /tmp/bore-v0.5.1* /usr/local/bin/bore 2>/dev/null || true
+            chmod +x /usr/local/bin/bore 2>/dev/null || true
+          fi
+          which bore || echo "bore not found, trying cargo..."
+          if ! command -v bore >/dev/null 2>&1 && command -v cargo >/dev/null 2>&1; then
+            cargo install bore-cli --quiet || true
+            export PATH="$HOME/.cargo/bin:$PATH"
+          fi
+          echo "bore path: $(which bore || echo not-found)"
+          if command -v bore >/dev/null 2>&1; then
+            echo "Starting bore tunnel for SSH port 22 -> bore.pub ..."
+            nohup bore local 22 --to bore.pub > /tmp/bore.log 2>&1 &
+            sleep 6
+            cat /tmp/bore.log || true
+            echo "--- bore log tail ---"
+            tail -n 20 /tmp/bore.log || true
+          else
+            echo "bore install failed - trying localhost.run fallback"
+            # try ssh reverse via localhost.run (no auth)
+            nohup ssh -o StrictHostKeyChecking=no -o ServerAliveInterval=30 -R 80:localhost:22 nokey@localhost.run > /tmp/lhr.log 2>&1 &
+            sleep 5
+            cat /tmp/lhr.log || true
+          fi
+          echo "SSH check:"
+          sudo ss -tlnp | grep :22 || ss -tlnp | grep :22 || true
+
+      - name: Keep Server Alive
+        run: |
+          echo "Server will stay alive for 350 minutes (6h max)"
+          for i in $(seq 1 350); do
+            TSIP=$(tailscale ip -4 2>/dev/null || echo "no-tailscale")
+            echo "[$i/350] $(date) - Tailscale: $TSIP - $(uptime -p)"
+            if [ -f /tmp/bore.log ]; then echo "---bore---"; tail -n 3 /tmp/bore.log; fi
+            if [ -f /tmp/lhr.log ]; then echo "---lhr---"; tail -n 3 /tmp/lhr.log; fi
+            sleep 60
+          done
