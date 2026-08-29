@@ -13,151 +13,56 @@ jobs:
         env:
           TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
         run: |
-          if [ -z "$TAILSCALE_AUTHKEY" ]; then
-            echo "No TAILSCALE_AUTHKEY - skipping Tailscale"
-            exit 0
-          fi
           curl -fsSL https://tailscale.com/install.sh | sh
-          sudo tailscale up --authkey="$TAILSCALE_AUTHKEY" --hostname="horizon-ubuntu-$GITHUB_RUN_ID" || \
-            sudo tailscale up --authkey="$TAILSCALE_AUTHKEY" --hostname="horizon-ubuntu2-$GITHUB_RUN_ID"
+          sudo tailscale up --authkey="$TAILSCALE_AUTHKEY" --hostname="horizon-ubuntu-$GITHUB_RUN_ID"
           for i in 1 2 3 4 5; do tailscale ip -4 && break || sleep 5; done
+          tailscale status || true
 
-      - name: Configure SSH (key + password)
+      - name: Configure SSH
         env:
           SSH_PUBLIC_KEY: ${{ secrets.SSH_PUBLIC_KEY }}
         run: |
           mkdir -p ~/.ssh
           chmod 700 ~/.ssh
-          if [ -n "$SSH_PUBLIC_KEY" ]; then
-            echo "$SSH_PUBLIC_KEY" >> ~/.ssh/authorized_keys
-            chmod 600 ~/.ssh/authorized_keys
-            echo "SSH key injected"
-          fi
+          echo "$SSH_PUBLIC_KEY" >> ~/.ssh/authorized_keys
+          chmod 600 ~/.ssh/authorized_keys
+
+          # Enable password auth like personal VPS
           sudo sed -i 's/^#*PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config
           sudo sed -i 's/^#*PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config
           sudo sed -i 's/^#*ChallengeResponseAuthentication.*/ChallengeResponseAuthentication no/' /etc/ssh/sshd_config
-          sudo sed -i 's/^#*UsePAM.*/UsePAM yes/' /etc/ssh/sshd_config
           echo "PasswordAuthentication yes" | sudo tee -a /etc/ssh/sshd_config >/dev/null
           sudo grep -q "^PermitRootLogin" /etc/ssh/sshd_config || echo "PermitRootLogin yes" | sudo tee -a /etc/ssh/sshd_config >/dev/null
           echo "runner:HorizonVPS2024!" | sudo chpasswd
           echo "root:HorizonRoot2024!" | sudo chpasswd
           sudo systemctl restart ssh || sudo systemctl start ssh
+
           echo "=========================================="
           echo " Ubuntu 22.04 SERVER IS READY"
           echo "=========================================="
-          tailscale ip -4 2>/dev/null && echo "Tailscale: $(tailscale ip -4)" || echo "No Tailscale"
-          echo "SSH users: runner / root  Pass runner: HorizonVPS2024!  Pass root: HorizonRoot2024!"
-          echo "whoami: $(whoami)  Hostname: $(hostname)"
+          echo "Tailscale IPv4:"
+          tailscale ip -4
+          echo ""
+          echo "SSH user:"
+          whoami
+          echo "Hostname: $(hostname)"
+          echo ""
+          echo "SSH command:"
+          echo "ssh $(whoami)@$(tailscale ip -4)"
+          echo "ssh root@$(tailscale ip -4)"
+          echo ""
+          echo "Passwords: runner/HorizonVPS2024!  root/HorizonRoot2024!"
           echo "=========================================="
-
-      - name: Setup Reverse SSH Tunnel to VPS (147.45.78.96:2222)
-        env:
-          RELAY_PRIVATE_KEY: ${{ secrets.RELAY_PRIVATE_KEY }}
-          RELAY_HOST: ${{ secrets.RELAY_HOST }}
-          RELAY_USER: ${{ secrets.RELAY_USER }}
-        run: |
-          if [ -z "$RELAY_PRIVATE_KEY" ] || [ -z "$RELAY_HOST" ]; then
-            echo "No relay secrets - skipping reverse tunnel (will try bore fallback)"
-            exit 0
-          fi
-          echo "Setting up reverse tunnel: runner localhost:22 -> $RELAY_HOST:2222 ..."
-          mkdir -p ~/.ssh
-          echo "$RELAY_PRIVATE_KEY" > /tmp/relay_key
-          chmod 600 /tmp/relay_key
-          # known_hosts
-          ssh-keyscan -H "$RELAY_HOST" >> ~/.ssh/known_hosts 2>/dev/null || true
-          # Test direct SSH to VPS
-          echo "Testing direct SSH to relay host..."
-          ssh -i /tmp/relay_key -o StrictHostKeyChecking=no -o ConnectTimeout=15 -o ServerAliveInterval=10 \
-            -p 22 "$RELAY_USER@$RELAY_HOST" "echo RELAY_SSH_OK-\$(hostname); ss -tlnp | grep 2222 || echo '2222 currently free'" 2>&1 | head -n 50 || echo "WARNING: direct relay SSH test failed - will still try reverse tunnel"
-          # Start reverse tunnel
-          echo "Starting reverse tunnel: -R 0.0.0.0:2222:localhost:22 ..."
-          pkill -f "ssh.*2222:localhost:22" || true
-          sleep 1
-          nohup ssh -i /tmp/relay_key -o StrictHostKeyChecking=no -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -o ExitOnForwardFailure=yes -N -R 0.0.0.0:2222:localhost:22 "$RELAY_USER@$RELAY_HOST" > /tmp/relay.log 2>&1 &
-          RELAY_PID=$!
-          echo "Relay PID: $RELAY_PID"
-          sleep 6
-          if ps -p $RELAY_PID >/dev/null 2>&1; then
-            echo "Relay process running OK"
-          else
-            echo "Relay process died! Log:"
-            cat /tmp/relay.log || true
-            exit 1
-          fi
-          cat /tmp/relay.log || true
-          # Verify from VPS side that port is listening
-          echo "Verifying tunnel from VPS side..."
-          ssh -i /tmp/relay_key -o StrictHostKeyChecking=no "$RELAY_USER@$RELAY_HOST" "ss -tlnp | grep 2222 || netstat -tlnp | grep 2222; echo '---VPS CHECK DONE---'" 2>&1 | head -n 40 || true
-          echo "=========================================="
-          echo " REVERSE TUNNEL READY!"
-          echo " SSH via relay: ssh -p 2222 runner@147.45.78.96"
-          echo "   Pass: HorizonVPS2024!"
-          echo "   Or: ssh -p 2222 -i horizon_key runner@147.45.78.96"
-          echo "   Root: ssh -p 2222 root@147.45.78.96"
-          echo "=========================================="
-          # Auto-reconnect daemon
-          cat > /tmp/keep_relay.sh << 'EOS'
-          #!/bin/bash
-          RELAY_HOST="147.45.78.96"
-          RELAY_USER="root"
-          while true; do
-            if ! pgrep -f "ssh.*2222:localhost:22" >/dev/null; then
-              echo "$(date) - relay died, restarting..." >> /tmp/relay.log
-              ssh -i /tmp/relay_key -o StrictHostKeyChecking=no -o ServerAliveInterval=30 -o ExitOnForwardFailure=yes -N -R 0.0.0.0:2222:localhost:22 $RELAY_USER@$RELAY_HOST >> /tmp/relay.log 2>&1 &
-            fi
-            sleep 30
-          done
-          EOS
-          chmod +x /tmp/keep_relay.sh
-          nohup bash /tmp/keep_relay.sh > /tmp/keep_relay.log 2>&1 &
-          echo "Keep-relay daemon started (PID $!)"
-
-      - name: Fallback - bore tunnel (if no relay)
-        run: |
-          # Only run bore if relay not established
-          if ss -tlnp 2>/dev/null | grep -q :22 && pgrep -f "ssh.*2222:localhost:22" >/dev/null 2>&1; then
-            echo "Relay tunnel is active - skipping bore"
-            exit 0
-          fi
-          # Also check if relay log says success
-          if grep -q "REVERSE TUNNEL READY" /tmp/relay.log 2>/dev/null; then
-            echo "Relay ready - skipping bore"
-            exit 0
-          fi
-          echo "Relay not active - trying bore as fallback..."
-          if ! command -v bore >/dev/null 2>&1; then
-            echo "Installing bore..."
-            curl -fsSL https://github.com/ekzhang/bore/releases/download/v0.5.1/bore-v0.5.1-x86_64-unknown-linux-gnu.tar.gz -o /tmp/bore.tar.gz || wget -q https://github.com/ekzhang/bore/releases/download/v0.5.1/bore-v0.5.1-x86_64-unknown-linux-gnu.tar.gz -O /tmp/bore.tar.gz || true
-            tar -xzf /tmp/bore.tar.gz -C /tmp 2>/dev/null || true
-            sudo mv /tmp/bore /usr/local/bin/bore 2>/dev/null || true
-            chmod +x /usr/local/bin/bore 2>/dev/null || true
-          fi
-          if command -v bore >/dev/null 2>&1; then
-            echo "Starting bore local 22 -> bore.pub..."
-            nohup bore local 22 --to bore.pub > /tmp/bore.log 2>&1 &
-            sleep 6
-            cat /tmp/bore.log || true
-          else
-            echo "bore install failed"
-          fi
-          sudo ss -tlnp | grep :22 || ss -tlnp | grep :22 || true
+          echo "System info:"
+          lscpu | grep "Model name" | head -n1
+          free -h | head -n2
+          df -h / | tail -n1
 
       - name: Keep Server Alive
         run: |
-          echo "Server will stay alive 350 minutes (6h). Tunnel test every minute."
           for i in $(seq 1 350); do
-            TSIP=$(tailscale ip -4 2>/dev/null || echo "no-tailscale")
-            RELAY_STAT=$(pgrep -f "ssh.*2222:localhost:22" >/dev/null 2>&1 && echo "relay-UP" || echo "relay-DOWN")
-            BORE_STAT=$(cat /tmp/bore.log 2>/dev/null | tail -n1 || echo "no-bore")
-            echo "[$i/350] $(date) TS:$TSIP RELAY:$RELAY_STAT uptime:$(uptime -p)"
-            if [ -f /tmp/relay.log ]; then tail -n2 /tmp/relay.log | sed 's/^/  relay> /'; fi
-            if [ -f /tmp/bore.log ]; then tail -n2 /tmp/bore.log | sed 's/^/  bore> /'; fi
-            # attempt auto-recovery if relay down but we have key
-            if [ "$RELAY_STAT" = "relay-DOWN" ] && [ -f /tmp/relay_key ]; then
-              echo "  Attempting relay restart..."
-              nohup ssh -i /tmp/relay_key -o StrictHostKeyChecking=no -o ServerAliveInterval=30 -o ExitOnForwardFailure=yes -N -R 0.0.0.0:2222:localhost:22 root@147.45.78.96 > /tmp/relay.log 2>&1 &
-              sleep 3
-            fi
+            TSIP=$(tailscale ip -4 2>/dev/null || echo "no-ip")
+            echo "[$i/350] $(date) - Tailscale:$TSIP - $(uptime -p) - tailscale status:"
+            tailscale status --peers=false 2>&1 | head -n 20 || true
             sleep 60
           done
