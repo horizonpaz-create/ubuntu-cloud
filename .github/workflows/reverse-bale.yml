@@ -1,0 +1,82 @@
+name: Reverse Bale APK
+
+on:
+  workflow_dispatch:
+
+jobs:
+  decompile:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Setup JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Install JADX
+        run: |
+          curl -sL -o /tmp/jadx.zip https://github.com/skylot/jadx/releases/download/v1.5.1/jadx-1.5.1.zip
+          mkdir -p /opt/jadx && unzip -o /tmp/jadx.zip -d /opt/jadx
+          chmod +x /opt/jadx/bin/*
+
+      - name: Download Bale APK
+        run: |
+          curl -sL -o /tmp/bale.apk https://bale.ai/apk/bale.apk
+          ls -lh /tmp/bale.apk
+
+      - name: Full decompile
+        run: |
+          /opt/jadx/bin/jadx \
+            --no-res \
+            --threads-count 2 \
+            --decompilation-mode simple \
+            --output-dir /tmp/bale-src \
+            /tmp/bale.apk
+          echo "=== stats ==="
+          find /tmp/bale-src -name '*.java' | wc -l
+
+      - name: Extract target classes
+        run: |
+          mkdir -p /tmp/bale-extract
+
+          # Messaging protocol classes
+          find /tmp/bale-src -path "*/bale/proto/*" -name "*.java" | while read f; do
+            mkdir -p "/tmp/bale-extract/proto/$(dirname "${f#*bale/proto/}")"
+            cp "$f" "/tmp/bale-extract/proto/${f#*bale/proto/}"
+          done
+
+          # Sequence / transport classes
+          find /tmp/bale-src -path "*/bale/*" -name "*Sequence*" -name "*.java" | while read f; do
+            cp "$f" /tmp/bale-extract/
+          done
+
+          # API message classes
+          find /tmp/bale-src -name "*ApiTextMessage*" -o -name "*ApiLongTextMessage*" \
+            -o -name "*TextCarrier*" -o -name "*MessageService*" | while read f; do
+            cp "$f" /tmp/bale-extract/ 2>/dev/null
+          done
+
+          # Network/socket layer
+          find /tmp/bale-src -path "*/bale/*" \( -name "*Socket*" -o -name "*Connection*" \
+            -o -name "*Transport*" -o -name "*Channel*" -o -name "*Gateway*" \) -name "*.java" | while read f; do
+            cp "$f" /tmp/bale-extract/ 2>/dev/null
+          done
+
+          echo "=== extracted files ==="
+          find /tmp/bale-extract -name "*.java" | wc -l
+          find /tmp/bale-extract -name "*.java" | head -30
+
+      - name: Upload extracted sources
+        uses: actions/upload-artifact@v4
+        with:
+          name: bale-proto-sources
+          path: /tmp/bale-extract/
+          retention-days: 7
+
+      - name: Upload full proto dir
+        uses: actions/upload-artifact@v4
+        with:
+          name: bale-full-proto
+          path: /tmp/bale-src/sources/ai/bale/proto/
+          retention-days: 7
