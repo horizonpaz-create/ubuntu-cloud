@@ -1,0 +1,89 @@
+name: textcarrier CI
+
+# Why this lives in a public repo
+# ---------------------------
+# `horizonpaz-create/rtc-lab` is private and its Actions minutes are
+# exhausted, so every job there fails with `conclusion: failure` and
+# `steps: 0` — the runner is never even allocated. A public repo has its
+# own free quota, so the test job runs here and pulls the source from
+# the private repo at runtime.
+#
+# This is the "billing-build-host" pattern: the PUBLIC repo is only a
+# runner host. It holds no source of its own beyond this file, and the
+# SHA under test is always an explicit input, never `main`.
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'SHA or branch of horizonpaz-create/rtc-lab to test'
+        required: true
+        default: 'main'
+      mode:
+        description: 'baseline = whole workspace, textcarrier = just the carrier'
+        required: true
+        type: choice
+        options: ['textcarrier', 'baseline']
+
+jobs:
+  textcarrier:
+    # One OS only: this is a Linux-only crate and the free quota is
+    # finite. The cross-OS matrix in the private repo's rust.yml costs
+    # 4x for coverage this crate does not need (no GUI/Windows paths).
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout rtc-lab source (private)
+        uses: actions/checkout@v4
+        with:
+          repository: horizonpaz-create/rtc-lab
+          ref: ${{ github.event.inputs.ref }}
+          token: ${{ secrets.RTC_LAB_TOKEN }}
+          path: rtc-lab
+
+      - name: Install toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: textcarrier-${{ github.event.inputs.ref }}-${{ github.run_id }}
+          restore-keys: textcarrier-${{ github.event.inputs.ref }}-
+
+      - name: Show what is under test
+        run: |
+          cd rtc-lab
+          echo "sha: $(git rev-parse HEAD)"
+          echo "--- dirty tree? ---"
+          git status --short || true
+          git diff --stat HEAD~1 2>/dev/null | tail -20 || true
+
+      - name: Build
+        working-directory: rtc-lab/textcarrier-rust
+        run: cargo build --workspace --release
+
+      - name: Test — textcarrier only
+        working-directory: rtc-lab/textcarrier-rust
+        run: cargo test -p textcarrier --release 2>&1 | tee test-output.log
+
+      - name: Report counts (never just "it compiled")
+        if: always()
+        working-directory: rtc-lab/textcarrier-rust
+        run: |
+          echo "=== test counts ==="
+          grep -E "^(test result|running [0-9]+ test)" test-output.log || \
+            echo "NO COUNTS FOUND — the log is not a test run"
+          echo "=== failures ==="
+          grep -E "^(failures:|test .* FAILED|error\[)" test-output.log | head -40 || \
+            echo "(none)"
+          grep -A30 "^failures:" test-output.log | head -50 || true
+
+      - name: Upload log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: textcarrier-test-log
+          path: rtc-lab/textcarrier-rust/test-output.log
+          retention-days: 7
