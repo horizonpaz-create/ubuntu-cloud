@@ -32,7 +32,7 @@ jobs:
             --threads-count 2 \
             --decompilation-mode simple \
             --output-dir /tmp/bale-src \
-            /tmp/bale.apk
+            /tmp/bale.apk || true
           echo "=== stats ==="
           find /tmp/bale-src -name '*.java' | wc -l
 
